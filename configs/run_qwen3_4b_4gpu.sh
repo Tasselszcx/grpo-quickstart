@@ -12,6 +12,15 @@
 # =============================================================================
 set -euo pipefail
 
+# ── 激活 venv ─────────────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+if [ -f "${PROJECT_ROOT}/venv/bin/activate" ]; then
+    source "${PROJECT_ROOT}/venv/bin/activate"
+else
+    echo "⚠️  未找到 venv，请先运行: bash setup.sh"; exit 1
+fi
+
 # ── 可配置变量 ─────────────────────────────────────────────────────────────────
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 

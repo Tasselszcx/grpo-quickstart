@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
 # GRPO Quickstart — 环境安装脚本
+# 使用 venv + pip，不依赖 conda
 # 适配：4× H800-80G，CUDA 12.x，Python 3.10+
-# 支持无 conda 环境（自动安装 Miniconda）
 # =============================================================================
 set -euo pipefail
 
@@ -12,133 +12,78 @@ warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONDA_ENV="verl"
-PYTHON_VERSION="3.10"
-MINICONDA_DIR="${HOME}/miniconda3"
+VENV_DIR="${PROJECT_DIR}/venv"
 
 info "项目目录: $PROJECT_DIR"
 
-# ── 0. 检查/安装 Miniconda ────────────────────────────────────────────────────
-install_miniconda() {
-    info "未找到 conda，自动安装 Miniconda3..."
-    ARCH=$(uname -m)   # x86_64 or aarch64
-    case "$ARCH" in
-        x86_64)  MC_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh" ;;
-        aarch64) MC_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-aarch64.sh" ;;
-        *) error "不支持的架构: $ARCH" ;;
-    esac
+# ── 1. 检查 Python ────────────────────────────────────────────────────────────
+PYTHON=$(command -v python3 || command -v python || error "找不到 python3")
+PY_VERSION=$($PYTHON --version 2>&1)
+info "Python: $PY_VERSION ($PYTHON)"
 
-    TMP_SH="/tmp/miniconda_install.sh"
-    info "下载 Miniconda: $MC_URL"
-    if command -v wget >/dev/null 2>&1; then
-        wget -q --show-progress "$MC_URL" -O "$TMP_SH"
-    elif command -v curl >/dev/null 2>&1; then
-        curl -L --progress-bar "$MC_URL" -o "$TMP_SH"
-    else
-        error "找不到 wget 或 curl，请手动安装 Miniconda"
-    fi
-
-    bash "$TMP_SH" -b -p "$MINICONDA_DIR"
-    rm -f "$TMP_SH"
-
-    # 写入 bashrc / bash_profile
-    "${MINICONDA_DIR}/bin/conda" init bash 2>/dev/null || true
-    info "Miniconda 安装完成: $MINICONDA_DIR"
-}
-
-# 查找 conda：先 PATH，再常见路径
-CONDA_CMD=""
-if command -v conda >/dev/null 2>&1; then
-    CONDA_CMD="conda"
-else
-    for CANDIDATE in \
-        "${MINICONDA_DIR}/bin/conda" \
-        "${HOME}/anaconda3/bin/conda" \
-        "/opt/conda/bin/conda" \
-        "/usr/local/anaconda3/bin/conda" \
-        "/opt/miniconda3/bin/conda"
-    do
-        if [ -x "$CANDIDATE" ]; then
-            CONDA_CMD="$CANDIDATE"
-            break
-        fi
-    done
-fi
-
-if [ -z "$CONDA_CMD" ]; then
-    install_miniconda
-    CONDA_CMD="${MINICONDA_DIR}/bin/conda"
-fi
-
-info "使用 conda: $CONDA_CMD ($(${CONDA_CMD} --version))"
-
-# 激活 conda base
-CONDA_BASE=$("$CONDA_CMD" info --base)
-# shellcheck disable=SC1091
-source "${CONDA_BASE}/etc/profile.d/conda.sh"
-
-# ── 1. 基础检查 ───────────────────────────────────────────────────────────────
+# ── 2. 检查 GPU ───────────────────────────────────────────────────────────────
 CUDA_VERSION=$(nvcc --version 2>/dev/null | grep -oP 'release \K[\d.]+' | head -1 || echo "unknown")
 GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l || echo 0)
 info "CUDA: $CUDA_VERSION | GPU 数量: ${GPU_COUNT}"
-[ "$GPU_COUNT" -lt 1 ] && warn "未检测到 GPU（nvidia-smi 失败），后续 torch 安装仍会继续"
 
-# ── 2. 创建 Conda 环境 ────────────────────────────────────────────────────────
-if conda env list | grep -qE "^${CONDA_ENV}\s"; then
-    warn "Conda 环境 '${CONDA_ENV}' 已存在，跳过创建（如需重建：conda env remove -n ${CONDA_ENV}）"
+# ── 3. 创建 venv ──────────────────────────────────────────────────────────────
+if [ -d "$VENV_DIR" ]; then
+    warn "venv 已存在，跳过创建（如需重建：rm -rf ${VENV_DIR} && bash setup.sh）"
 else
-    info "创建 conda 环境: ${CONDA_ENV} (Python ${PYTHON_VERSION})"
-    conda create -n "${CONDA_ENV}" python="${PYTHON_VERSION}" -y
+    info "创建 venv: $VENV_DIR"
+    $PYTHON -m venv "$VENV_DIR"
 fi
 
-conda activate "${CONDA_ENV}"
-info "已激活: $(which python3) | $(python3 --version)"
+# 激活 venv
+# shellcheck disable=SC1091
+source "${VENV_DIR}/bin/activate"
+info "已激活 venv: $(which python) | $(python --version)"
 
-# ── 3. 检测 CUDA 版本并安装对应 PyTorch ──────────────────────────────────────
+# 升级 pip
+pip install --upgrade pip setuptools wheel -q
+
+# ── 4. 检测 CUDA 版本，选对应 PyTorch wheel ──────────────────────────────────
 info "安装 PyTorch..."
-CUDA_MAJOR=$(echo "$CUDA_VERSION" | cut -d. -f1)
-CUDA_MINOR=$(echo "$CUDA_VERSION" | cut -d. -f2)
+CUDA_MAJOR=$(echo "$CUDA_VERSION" | cut -d. -f1 2>/dev/null || echo "0")
+CUDA_MINOR=$(echo "$CUDA_VERSION" | cut -d. -f2 2>/dev/null || echo "0")
 
-# 根据 CUDA 版本选择 wheel index
-if   [ "$CUDA_MAJOR" -ge 12 ] && [ "$CUDA_MINOR" -ge 4 ]; then
+if   [ "${CUDA_MAJOR:-0}" -ge 12 ] && [ "${CUDA_MINOR:-0}" -ge 4 ]; then
     TORCH_CUDA="cu124"
-elif [ "$CUDA_MAJOR" -ge 12 ] && [ "$CUDA_MINOR" -ge 1 ]; then
+elif [ "${CUDA_MAJOR:-0}" -ge 12 ]; then
     TORCH_CUDA="cu121"
-elif [ "$CUDA_MAJOR" -ge 11 ] && [ "$CUDA_MINOR" -ge 8 ]; then
+elif [ "${CUDA_MAJOR:-0}" -ge 11 ]; then
     TORCH_CUDA="cu118"
 else
-    warn "CUDA 版本 $CUDA_VERSION 较旧，尝试 cu118"
-    TORCH_CUDA="cu118"
+    warn "无法检测 CUDA 版本，默认用 cu124（H800 标准）"
+    TORCH_CUDA="cu124"
 fi
-info "PyTorch wheel: $TORCH_CUDA"
+info "PyTorch wheel index: $TORCH_CUDA"
 
 pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
     --index-url "https://download.pytorch.org/whl/${TORCH_CUDA}" -q
 
-# ── 4. 安装 vLLM ─────────────────────────────────────────────────────────────
+# ── 5. 安装 vLLM ─────────────────────────────────────────────────────────────
 info "安装 vLLM 0.8.5..."
 pip install vllm==0.8.5 -q
 
-# ── 5. 安装 veRL ─────────────────────────────────────────────────────────────
+# ── 6. 安装 veRL ─────────────────────────────────────────────────────────────
 info "安装 veRL..."
 pip install verl -q 2>/dev/null || {
     warn "pip install verl 失败，从源码安装..."
-    VERL_DIR="${PROJECT_DIR}/../verl_src"
-    if [ ! -d "$VERL_DIR" ]; then
-        git clone https://github.com/volcengine/verl.git "$VERL_DIR" --depth=1
-    fi
-    pip install -e "${VERL_DIR}[vllm]" -q
+    VERL_SRC="${PROJECT_DIR}/../verl_src"
+    [ -d "$VERL_SRC" ] || git clone https://github.com/volcengine/verl.git "$VERL_SRC" --depth=1
+    pip install -e "${VERL_SRC}[vllm]" -q
 }
 
-# ── 6. Flash Attention 2 ─────────────────────────────────────────────────────
+# ── 7. Flash Attention 2 ─────────────────────────────────────────────────────
 info "安装 flash-attn（首次编译约 5-15 分钟，请耐心等待）..."
 pip install packaging ninja -q
 MAX_JOBS=8 pip install flash-attn --no-build-isolation -q 2>/dev/null || {
-    warn "预编译包安装失败，改用源码编译..."
+    warn "预编译失败，改用源码编译（会更慢）..."
     MAX_JOBS=4 pip install flash-attn --no-build-isolation -q
 }
 
-# ── 7. 其余依赖 ───────────────────────────────────────────────────────────────
+# ── 8. 其余依赖 ───────────────────────────────────────────────────────────────
 info "安装其余依赖..."
 pip install -q \
     transformers>=4.47.0 \
@@ -151,9 +96,17 @@ pip install -q \
     rich \
     "ray[default]>=2.35.0"
 
-# ── 8. 验证 ───────────────────────────────────────────────────────────────────
+# ── 9. 写激活脚本 ─────────────────────────────────────────────────────────────
+cat > "${PROJECT_DIR}/activate.sh" << EOF
+#!/usr/bin/env bash
+# 每次新开终端先运行这个：source activate.sh
+source "${VENV_DIR}/bin/activate"
+echo "[grpo-quickstart] venv 已激活: \$(python --version)"
+EOF
+
+# ── 10. 验证安装 ──────────────────────────────────────────────────────────────
 info "验证安装..."
-python3 - << 'PYEOF'
+python - << 'PYEOF'
 import torch, verl, vllm, flash_attn, wandb
 print(f"  torch:      {torch.__version__}")
 print(f"  CUDA avail: {torch.cuda.is_available()} ({torch.cuda.device_count()} GPUs)")
@@ -166,14 +119,11 @@ PYEOF
 echo ""
 info "✅ 环境安装完成！"
 echo ""
+echo "  之后每次新开终端，先激活 venv："
+echo "    source ${PROJECT_DIR}/activate.sh"
+echo ""
 echo "  下一步："
-echo "    conda activate verl"
+echo "    source activate.sh"
 echo "    python scripts/prepare_data.py --save_dir ./data"
 echo "    bash configs/run_qwen3_4b_4gpu.sh"
 echo ""
-# 提示 shell 重载（conda init 写了 bashrc）
-if [ -n "${CONDA_CMD:-}" ] && echo "$CONDA_CMD" | grep -q miniconda; then
-    echo "  ⚠️  首次安装 Miniconda，请执行以下命令让 conda 命令生效："
-    echo "    source ~/.bashrc"
-    echo "  之后再 conda activate verl"
-fi
