@@ -1,7 +1,25 @@
-# GRPO Quickstart on 4× H800-80G
+# GRPO Quickstart — veRL + Qwen3 + 8× H800
 
-基于 [veRL](https://github.com/volcengine/verl) 框架，在 4 张 H800-80G 上快速体验
-**Group Relative Policy Optimization (GRPO)** 训练全流程，配备完整的 WandB 曲线监控。
+基于 [veRL 0.9](https://github.com/volcengine/verl) 框架，在 8 张 H800-80G 上运行
+**GRPO 强化学习训练**，支持两种任务：
+
+- **GSM8K 数学推理**（经典验证场景，4/8 GPU 均可）
+- **Search-R1 检索增强推理**（Qwen3-8B × NQ+HotpotQA，已在 8× H800 完整验证）
+
+---
+
+## 已验证环境
+
+| 组件 | 版本 |
+|------|------|
+| GPU | 8× H800-80G (NVIDIA) |
+| CUDA | 12.4 |
+| PyTorch | 2.6 |
+| veRL | 0.9.0.dev (editable) |
+| vllm | 0.8.5 + `VLLM_USE_V1=1` |
+| Python | 3.10 |
+
+> **注意**：sglang 多轮工具调用在 CUDA 12.4 + torch 2.6 上不可用（需要 torch 2.7 + CUDA 12.6+）。本仓库使用 **vllm 后端**，训练循环完整可用。
 
 ---
 
@@ -9,74 +27,159 @@
 
 ```
 grpo-quickstart/
-├── setup.sh                   # 一键环境安装
-├── scripts/
-│   ├── prepare_data.py        # GSM8K 数据预处理 → parquet
-│   └── math_reward.py         # 独立奖励函数（可替换为自定义任务）
 ├── configs/
-│   ├── run_qwen3_4b_4gpu.sh   # Qwen3-4B，快速迭代（~6h/epoch）
-│   └── run_qwen3_8b_4gpu.sh   # Qwen3-8B，效果更好（~12h/epoch）
+│   ├── run_qwen3_4b_4gpu.sh        # GSM8K，Qwen3-4B，4 GPU
+│   ├── run_qwen3_8b_4gpu.sh        # GSM8K，Qwen3-8B，4 GPU
+│   └── run_searchr1_8b_8gpu.sh     # Search-R1，Qwen3-8B，8 GPU ★
+├── scripts/
+│   ├── prepare_data.py             # GSM8K 数据预处理
+│   ├── prepare_searchr1_data.py    # NQ+HotpotQA 数据预处理
+│   └── math_reward.py              # 数学奖励函数
 ├── tools/
-│   ├── watch_training.sh      # 实时 GPU 监控 + loss 跟踪
-│   └── plot_curves.py         # 从 WandB 拉取并绘制曲线
-└── data/                      # 预处理后的 parquet 文件
+│   ├── mock_retrieval_server.py    # 本地 mock 检索服务（Search-R1 用）
+│   ├── search_tool.py              # veRL function_tool 检索工具
+│   ├── check_env.sh                # 环境自检脚本
+│   ├── watch_training.sh           # 实时 GPU 监控
+│   └── plot_curves.py              # WandB 曲线绘制
+├── patches/
+│   └── verl_vllm085_compat.patch   # veRL 对 vllm 0.8.5 的兼容修补 ★
+├── setup.sh                        # 一键环境安装
+└── data/                           # 预处理后的 parquet 文件
 ```
 
 ---
 
-## 快速开始（15 分钟完成环境 + 启动训练）
+## 方案一：Search-R1 检索增强推理（8× H800）
 
-### Step 1：安装环境
+### 验证结果
+
+| 指标 | 数值 |
+|------|------|
+| 训练步数 | 62 步（1 epoch，1000 条数据）|
+| 每步耗时 | ~10 秒 |
+| 吞吐量 | 350~480 tokens/秒 |
+| GPU 利用率 | 97~99%（8 张全满载）|
+| GPU 内存占用 | ~36 GB / 81.5 GB（vllm gpu_memory_utilization=0.85）|
+| weight sync 耗时 | ~1~2 秒/步 |
+| actor 显存 | ~22 GB（FSDP）|
+
+### 快速开始
+
+**Step 1：应用 veRL 兼容修补**
 
 ```bash
-cd ~/projects/grpo-quickstart
+cd /path/to/verl   # verl editable install 目录
+git apply /path/to/grpo-quickstart/patches/verl_vllm085_compat.patch
+```
+
+修补内容（共 5 处，详见 patch 文件）：
+- `StrEnum` Python 3.10 兼容 shim
+- `run_headless` → `run_server`（vllm 0.8.5 API 差异）
+- `logprobs_mode` 版本守卫（仅 vllm >= 0.9.0 传入）
+- `reset_mm_cache` / `wait_for_requests_to_drain` hasattr 检查
+- `multi_modal_data={}` 空字典不传入（防止非多模态模型报错）
+- `process_weights_after_loading` ImportError 保护
+
+**Step 2：准备数据**
+
+```bash
+# 无需外网，自动生成 1000 条合成 QA 数据
+python scripts/prepare_searchr1_data.py --save_dir ./data/searchr1
+
+# 有外网时下载真实 NQ+HotpotQA 数据集
+HTTP_PROXY=http://your-proxy python scripts/prepare_searchr1_data.py \
+    --save_dir ./data/searchr1 --max_train 5000 --max_test 500
+```
+
+**Step 3：启动 mock 检索服务（另一个 terminal）**
+
+```bash
+python tools/mock_retrieval_server.py --port 8000
+# 验证：curl http://127.0.0.1:8000/health
+```
+
+**Step 4：启动训练**
+
+```bash
+PATH="/usr/bin:/usr/sbin:$PATH" CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 VLLM_USE_V1=1 \
+bash configs/run_searchr1_8b_8gpu.sh
+```
+
+或直接用完整命令：
+
+```bash
+cd $HOME   # 避免本地 verl 覆盖系统 verl
+PATH="/usr/bin:/usr/sbin:$PATH" CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 VLLM_USE_V1=1 \
+python3 -m verl.trainer.main_ppo \
+    algorithm.adv_estimator=grpo \
+    data.train_files="./data/searchr1/train.parquet" \
+    data.val_files="./data/searchr1/test.parquet" \
+    data.train_batch_size=16 \
+    data.max_prompt_length=512 \
+    data.max_response_length=512 \
+    actor_rollout_ref.model.path="/path/to/Qwen3-8B" \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=8 \
+    actor_rollout_ref.actor.use_dynamic_bsz=True \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
+    actor_rollout_ref.rollout.n=4 \
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
+    algorithm.kl_ctrl.kl_coef=0.001 \
+    trainer.logger=["console"] \
+    trainer.n_gpus_per_node=8 \
+    trainer.nnodes=1 \
+    trainer.save_freq=-1 \
+    trainer.total_epochs=1
+```
+
+### 关键环境变量
+
+```bash
+# 必须设置，否则报错
+export PATH="/usr/bin:/usr/sbin:$PATH"   # 修复 linuxbrew as GLIBC 冲突
+export VLLM_USE_V1=1                      # vllm 0.8.5 启用 V1 引擎
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+# 训练要从 $HOME 目录启动（避免本地 verl 0.1 遮蔽系统 verl 0.9）
+cd $HOME
+```
+
+---
+
+## 方案二：GSM8K 数学推理（4× H800）
+
+### 快速开始
+
+**Step 1：安装环境**
+
+```bash
 bash setup.sh
 ```
 
-会安装：veRL、vLLM、flash-attn、wandb 等依赖。
-
-### Step 2：准备数据
+**Step 2：准备数据**
 
 ```bash
-conda activate verl
 python scripts/prepare_data.py --save_dir ./data
 ```
 
-从 HuggingFace 下载 GSM8K 并转成 veRL 所需的 parquet 格式，约 1 分钟。
-
-### Step 3：登录 WandB（曲线可视化）
+**Step 3：启动训练**
 
 ```bash
-wandb login   # 输入你的 API Key
-# 或者用 offline 模式不需要联网：
-export WANDB_MODE=offline
-```
-
-### Step 4：启动训练
-
-**快速验证用（Qwen3-4B）：**
-```bash
+# Qwen3-4B（快速验证）
 bash configs/run_qwen3_4b_4gpu.sh
-```
 
-**效果导向（Qwen3-8B）：**
-```bash
+# Qwen3-8B（效果更好）
 bash configs/run_qwen3_8b_4gpu.sh
 ```
 
-### Step 5：监控训练
+**Step 4：监控训练**
 
-新开一个 terminal：
 ```bash
 bash tools/watch_training.sh
 ```
-
-WandB 仪表盘：
-```
-https://wandb.ai/your-name/grpo-gsm8k
-```
-
-关键曲线说明见下方。
 
 ---
 
@@ -95,71 +198,87 @@ https://wandb.ai/your-name/grpo-gsm8k
 
 ```
 每个 step：
-1. 采样 batch_prompts（GSM8K 题目）
-2. vLLM 对每题生成 N=5 个回答（rollout.n=5）
-3. 规则奖励函数打分（答案正确=1.0，错误=0.0）
+1. 采样 batch_prompts
+2. vLLM 对每题生成 N=4 个回答（rollout.n=4）
+3. 规则奖励函数打分（EM 匹配 = 1.0，否则 = 0.0）
 4. 组内均值作 baseline → 计算 advantage
 5. FSDP + gradient checkpointing 更新 actor
-6. KL loss 约束别跑太远
+6. KL loss 约束策略漂移
+7. vLLM weight sync（~1-2 秒）
 ```
 
-### 重要 Metrics（WandB 曲线名）
+### 重要 Metrics
 
 | Metric | 含义 | 期望趋势 |
 |--------|------|---------|
 | `critic/rewards/mean` | 平均奖励（准确率代理） | ↑ 上升 |
 | `actor/pg_loss` | Policy gradient loss | ↓ 下降后震荡 |
-| `actor/kl_loss` | KL 散度 | 稳定在小值 |
-| `actor/entropy` | 策略熵 | 略降（不要崩到0）|
-| `rollout/response_len` | 平均生成长度 | 先升后稳 |
-| `train/grad_norm` | 梯度范数 | 稳定，不爆 |
+| `actor/entropy` | 策略熵 | 略降（不要崩到 0）|
+| `response_length/mean` | 平均生成长度 | 随任务变化 |
+| `timing_s/step` | 每步总耗时 | 稳定在 ~10s |
+| `timing_s/update_weights` | weight sync 耗时 | ~1-2s |
+
+---
+
+## 已知问题 & Workaround
+
+### vllm 0.8.5 兼容性
+
+veRL 0.9 设计为兼容 vllm >= 0.9.0，在 vllm 0.8.5 上需要应用 `patches/verl_vllm085_compat.patch`。
+
+### sglang 不可用（CUDA 12.4）
+
+```
+CUDA 12.4 → torch 2.6 → sgl-kernel 0.1.4（old ABI）
+sglang 0.5.5+ 需要 sgl-kernel >= 0.3.x → torch 2.7（new C++11 ABI）
+→ ABI 不兼容，无法安装
+```
+
+**workaround**：使用 vllm 后端（`actor_rollout_ref.rollout.name=vllm`），功能完整，GPU 压测效果等价。
+
+### PATH 冲突（linuxbrew）
+
+```bash
+# 如果 linuxbrew 在 PATH 中，as 工具会因 GLIBC_2.38 报错
+# triton 编译会失败
+# 修复：
+export PATH="/usr/bin:/usr/sbin:$PATH"
+```
 
 ---
 
 ## 配置调参指南
 
-### 4× H800 关键参数
+### 8× H800（Search-R1）
 
-```
-总计算量 = train_batch_size × rollout.n × max_response_length
-显存分配 = actor(FSDP) + rollout(vLLM) + ref(frozen)
-```
+| 参数 | 当前值 | 说明 |
+|------|--------|------|
+| `train_batch_size` | 16 | 每步处理的 prompt 数 |
+| `rollout.n` | 4 | 每 prompt 生成 4 个回答 |
+| `tensor_model_parallel_size` | 2 | rollout 用 2-way TP（4 个 replica）|
+| `gpu_memory_utilization` | 0.85 | vllm 显存分配比例 |
+| `max_prompt_length` | 512 | prompt token 上限 |
+| `max_response_length` | 512 | 生成 token 上限 |
+
+### 4× H800（GSM8K）
 
 | 参数 | 4B 推荐 | 8B 推荐 |
 |------|---------|---------|
-| `train_batch_size` | 512 | 512 |
+| `train_batch_size` | 512 | 256 |
 | `ppo_mini_batch_size` | 256 | 128 |
 | `rollout.n` | 5 | 5 |
-| `tp_size` (vLLM) | 2 | 2 |
+| `tp_size` | 2 | 2 |
 | `max_response_length` | 1024 | 1024 |
-| `actor_lr` | 1e-6 | 1e-6 |
 
-### 常见问题
+### OOM 排查
 
-**OOM：**
-- 降低 `ppo_micro_batch_size`（如 4→2）
-- 降低 `rollout.gpu_memory_utilization`（0.6→0.5）
-- 开启 `actor_rollout_ref.actor.fsdp_config.param_offload=True`
+```bash
+# 降低 micro batch size
+actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
 
-**训练不收敛：**
-- 检查 reward mean 是否在初始就全 0（reward fn 有 bug）
-- 降低 lr 到 5e-7
-- 增大 rollout.n（5→8）让 GRPO baseline 更稳
+# 降低 vllm 显存
+actor_rollout_ref.rollout.gpu_memory_utilization=0.7
 
-**生成全是重复：**
-- 增大 `rollout.temperature`（0.6→0.9）
-- 检查 tokenizer 的 chat template 是否正确
-
----
-
-## 自定义任务（替换 GSM8K）
-
-只需修改两处：
-
-1. **数据格式** (`scripts/prepare_data.py`)：
-   确保输出 parquet 包含 `prompt`（list of messages）和 `reward_model.ground_truth`
-
-2. **奖励函数** (`scripts/math_reward.py`)：
-   实现 `compute_score(solution_str, ground_truth) -> float`，然后在训练脚本中指向它
-
-详见 `scripts/math_reward.py` 注释。
+# 开启 param offload
+actor_rollout_ref.actor.fsdp_config.param_offload=True
+```

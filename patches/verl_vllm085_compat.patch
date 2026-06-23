@@ -1,0 +1,105 @@
+diff --git a/verl/utils/tokenizer/continuous_token_wiring.py b/verl/utils/tokenizer/continuous_token_wiring.py
+index fd038da9..81c1b53d 100644
+--- a/verl/utils/tokenizer/continuous_token_wiring.py
++++ b/verl/utils/tokenizer/continuous_token_wiring.py
+@@ -17,7 +17,14 @@ from __future__ import annotations
+ 
+ import logging
+ import re
+-from enum import StrEnum
++try:
++    from enum import StrEnum
++except ImportError:
++    # Python 3.10 compatibility shim
++    from enum import Enum
++
++    class StrEnum(str, Enum):
++        pass
+ from typing import Any
+ 
+ from .continuous_token import (
+diff --git a/verl/workers/rollout/vllm_rollout/utils.py b/verl/workers/rollout/vllm_rollout/utils.py
+index 4249c313..0c18b049 100644
+--- a/verl/workers/rollout/vllm_rollout/utils.py
++++ b/verl/workers/rollout/vllm_rollout/utils.py
+@@ -286,10 +286,12 @@ class vLLMColocateWorkerExtension:
+             logger.info("ModelOpt QAT: process_weights_after_loading completed")
+         elif use_standard_weight_load:
+             # Some post-load transforms are non-idempotent; run once after all buckets.
+-            from vllm.model_executor.model_loader.utils import process_weights_after_loading
+-
+-            for model, model_config in self._iter_all_models_with_config():
+-                process_weights_after_loading(model, model_config, self.device)
++            try:
++                from vllm.model_executor.model_loader.utils import process_weights_after_loading
++                for model, model_config in self._iter_all_models_with_config():
++                    process_weights_after_loading(model, model_config, self.device)
++            except ImportError:
++                pass  # vllm < 0.9.0 does not have process_weights_after_loading
+ 
+     def _apply_buffer_updates_all_models(self, buffer_updates, main_named_buffers):
+         """Apply buffer updates to the main model and any synced MTP drafter.
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index 43d828a1..b8fc46a8 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -26,7 +26,15 @@ from packaging import version
+ from ray.actor import ActorHandle
+ from vllm import SamplingParams
+ from vllm.engine.arg_utils import AsyncEngineArgs
+-from vllm.entrypoints.cli.serve import run_headless
++try:
++    from vllm.entrypoints.cli.serve import run_headless
++except ImportError:
++    # vllm < 0.9 compatibility shim
++    import uvloop as _uvloop
++    from vllm.entrypoints.openai.api_server import run_server as _run_server
++
++    def run_headless(args):
++        _uvloop.run(_run_server(args))
+ from vllm.entrypoints.openai.api_server import build_app, init_app_state
+ from vllm.inputs import TokensPrompt
+ from vllm.lora.request import LoRARequest
+@@ -268,7 +276,7 @@ class vLLMHttpServer:
+             "max_num_batched_tokens": self.config.max_num_batched_tokens,
+             "enable_prefix_caching": self.config.enable_prefix_caching,
+             "enable_sleep_mode": self.config.enable_sleep_mode,
+-            "logprobs_mode": self.config.logprobs_mode,
++            **({"logprobs_mode": self.config.logprobs_mode} if _VLLM_VERSION >= version.parse("0.9.0") else {}),
+             "enforce_eager": self.config.enforce_eager,
+             "gpu_memory_utilization": self.config.gpu_memory_utilization,
+             "disable_log_stats": self.config.disable_log_stats,
+@@ -402,8 +410,9 @@ class vLLMHttpServer:
+ 
+         engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
+ 
+-        # Don't keep the dummy data in memory
+-        await engine_client.reset_mm_cache()
++        # Don't keep the dummy data in memory (vllm >= 0.9.0 only)
++        if hasattr(engine_client, "reset_mm_cache"):
++            await engine_client.reset_mm_cache()
+         await engine_client.collective_rpc(
+             method="monkey_patch_model", kwargs={"vocab_size": len(self.model_config.tokenizer)}
+         )
+@@ -519,7 +528,9 @@ class vLLMHttpServer:
+         if audio_data is not None:
+             multi_modal_data["audio"] = audio_data
+ 
+-        prompt_kwargs = {"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data}
++        prompt_kwargs = {"prompt_token_ids": prompt_ids}
++        if multi_modal_data:  # only pass if non-empty; vllm 0.8.5 raises if passed for non-multimodal models
++            prompt_kwargs["multi_modal_data"] = multi_modal_data
+         if mm_processor_kwargs:
+             prompt_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+         try:
+@@ -693,7 +704,9 @@ class vLLMHttpServer:
+         self.global_steps = global_steps
+ 
+     async def wait_for_requests_to_drain(self):
+-        await self.engine.wait_for_requests_to_drain()
++        if hasattr(self.engine, "wait_for_requests_to_drain"):
++            await self.engine.wait_for_requests_to_drain()
++        # vllm < 0.9.0: no-op, requests complete synchronously
+ 
+     async def abort_all_requests(self, reset_prefix_cache: bool = True) -> dict[str, Any]:
+         """Abort all ongoing generation requests.
