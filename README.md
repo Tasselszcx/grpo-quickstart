@@ -51,27 +51,31 @@ grpo-quickstart/
 
 ## 方案一：Search-R1 检索增强推理（8× H800）
 
-### 训练曲线（Qwen3-8B，62 步预跑）
+### 训练曲线（Qwen3-8B，500 步完整跑，真实 NQ 数据）
 
-![training curves](outputs/searchr1_qwen3_8b_training_curves.png)
+![500步训练曲线](outputs/searchr1_qwen3_8b_500steps_curves.png)
 
-> **曲线说明**
-> - **Reward**：从 0 上升至均值 0.106（step 58-62），趋势明显，62 步尚在爬升阶段
-> - **Response Length**：480 → 420 tokens，模型学会用更短的回答命中答案
-> - **Entropy**：0.28 → 0.20，策略收敛但未崩塌
-> - **Throughput**：平均 442 tokens/s，稳定在 440-460（step 1 因 triton 预热偏低）
-> - **Step Time**：稳定 ~10.3s/步
-> - **KL**：0.0008~0.0016，actor 与 ref 偏离极小
+> **曲线说明（500 步 × 真实 NQ+HotpotQA 数据）**
+> - **Reward (EM)**：0.047 → 均值 0.207（后20步），最高 0.531，明显上升趋势
+> - **Response Length**：455 → 294 tokens，模型学会用更简洁的回答
+> - **Entropy**：0.256 → 0.116，策略收敛但未崩塌
+> - **Throughput**：平均 403 tokens/s（后50步）
+> - **Step Time**：稳定 ~8.6s/步
+> - **KL**：始终极小，actor 与 ref 策略偏离可控
 
-### 验证结果
+**早期预跑曲线（62 步合成数据）**
+
+![62步预跑曲线](outputs/searchr1_qwen3_8b_training_curves.png)
+
+### 验证结果（500 步完整训练）
 
 | 指标 | 数值 |
 |------|------|
-| 训练步数 | 62 步（1 epoch，1000 条数据）|
-| 每步耗时 | ~10 秒 |
-| 吞吐量 | 350~480 tokens/秒 |
-| GPU 利用率 | 97~99%（8 张全满载）|
-| GPU 内存占用 | ~36 GB / 81.5 GB（vllm gpu_memory_utilization=0.85）|
+| 训练步数 | 500 步（1 epoch，8000 条真实 NQ 数据）|
+| 最终 Reward (EM) | ~0.207（后20步均值），最高 0.531 |
+| 每步耗时 | ~8.6 秒 |
+| 吞吐量 | ~403 tokens/秒（后50步均值）|
+| GPU 内存占用 | ~40 GB / 81.5 GB（vllm gpu_memory_utilization=0.7）|
 | weight sync 耗时 | ~1~2 秒/步 |
 | actor 显存 | ~22 GB（FSDP）|
 
