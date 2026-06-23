@@ -51,6 +51,18 @@ grpo-quickstart/
 
 ## 方案一：Search-R1 检索增强推理（8× H800）
 
+### 训练曲线（Qwen3-8B，62 步预跑）
+
+![training curves](outputs/searchr1_qwen3_8b_training_curves.png)
+
+> **曲线说明**
+> - **Reward**：从 0 上升至均值 0.106（step 58-62），趋势明显，62 步尚在爬升阶段
+> - **Response Length**：480 → 420 tokens，模型学会用更短的回答命中答案
+> - **Entropy**：0.28 → 0.20，策略收敛但未崩塌
+> - **Throughput**：平均 442 tokens/s，稳定在 440-460（step 1 因 triton 预热偏低）
+> - **Step Time**：稳定 ~10.3s/步
+> - **KL**：0.0008~0.0016，actor 与 ref 偏离极小
+
 ### 验证结果
 
 | 指标 | 数值 |
