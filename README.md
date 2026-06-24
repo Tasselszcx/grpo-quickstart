@@ -314,8 +314,8 @@ export PATH="/usr/bin:/usr/sbin:$PATH"
 |------|--------|------|
 | `train_batch_size` | 16 | 每步处理的 prompt 数 |
 | `rollout.n` | 4 | 每 prompt 生成 4 个回答 |
-| `tensor_model_parallel_size` | 2 | rollout 用 2-way TP（4 个 replica）|
-| `gpu_memory_utilization` | 0.85 | vllm 显存分配比例 |
+| `tensor_model_parallel_size` | 2 | rollout 用 2-way TP（8卡 = 4 replica × 2 TP）|
+| `gpu_memory_utilization` | 0.7 | vllm 显存分配比例（0.85 会 OOM，见下）|
 | `max_prompt_length` | 512 | prompt token 上限 |
 | `max_response_length` | 512 | 生成 token 上限 |
 
@@ -341,3 +341,94 @@ actor_rollout_ref.rollout.gpu_memory_utilization=0.7
 # 开启 param offload
 actor_rollout_ref.actor.fsdp_config.param_offload=True
 ```
+
+---
+
+## 显存与并行详解（实验记录）
+
+> 本节记录我们在 8×H800 上跑 Search-R1（Qwen3-8B）时对显存的实测与推导，以及踩过的 OOM 坑。
+
+### 并行布局：8 卡是怎么用的
+
+`tensor_model_parallel_size=2` 不代表只用 2 张卡。TP（张量并行）和卡总数是两个维度，veRL 自动把卡分组：
+
+```
+8 卡 = 4 个 vllm 实例(DP=4) × 每实例 2 卡(TP=2)
+
+实例0: GPU0,1   实例1: GPU2,3   实例2: GPU4,5   实例3: GPU6,7
+        每个实例是一个完整的 Qwen3-8B（切成2片），并行处理不同的数据
+```
+
+- **TP=2**：把**一个** 8B 模型切成 2 半放 2 张卡协同推理（同一份模型、同一条请求）。
+- **DP = 总卡数 / TP = 8 / 2 = 4**：4 个独立 vllm 副本，并行吃 4 倍数据。
+- **为什么不用 TP=8**：8B 在 H800（81.5GB）上 TP=2 就装得下；TP 越大卡间通信开销越高。`TP=2 + DP=4` 的吞吐 > `TP=8 + DP=1`。原则：**用最小的 TP 装下模型，剩余卡全做数据并行扩吞吐**。
+
+### 显存计算：allocated vs reserved
+
+PyTorch 显存有两层，日志里都有（`actor/perf/max_memory_*`）：
+
+| 指标 | 实测值 | 含义 |
+|------|--------|------|
+| `max_memory_allocated` | ~22 GB | **真正装着张量的显存**（此刻在用的）|
+| `max_memory_reserved` | ~44 GB | **PyTorch 向 GPU 占住的总量**（缓存分配器多要的池子）|
+
+`reserved ≥ allocated + 缓存池空闲块`。缓存分配器一次多要显存放进池子，张量反复创建/销毁直接从池里拿，避免每次都向 GPU 申请（慢）。**判断 OOM 要看 reserved（44GB），因为这部分真的从卡上占走了。**
+
+### 8B 训练的显存从哪来：FSDP 分片
+
+一个 8B 模型若**不分片**单卡全存，训练需要（bf16=2字节/参数，fp32=4字节/参数）：
+
+| 项目 | 精度 | 算法 | 大小 |
+|------|------|------|------|
+| 模型权重 | bf16 | 8B × 2 | 16 GB |
+| 梯度 | bf16 | 8B × 2 | 16 GB |
+| Adam 一阶动量 m | fp32 | 8B × 4 | 32 GB |
+| Adam 二阶动量 v | fp32 | 8B × 4 | 32 GB |
+| **合计（未含激活）** | | | **≈ 96 GB** |
+
+单张 81.5GB 的 H800 **放不下**，必须分片。**FSDP（Fully Sharded Data Parallel）** 把权重/梯度/优化器状态在 8 卡上各存 1/8，需要完整权重时临时 all-gather 凑齐、用完即扔：
+
+```
+不分片单卡 96GB+  ──FSDP 切 8 份──▶  每卡常驻 ≈ 96/8 ≈ 12GB
+                                      + 激活值(不分片，随 seq/batch 涨)
+                                      + all-gather 临时凑权重的副本
+                                      + PyTorch 缓存池冗余
+                                      ─────────────────────────
+                                      = reserved ≈ 44GB（实测，OOM 看这个）
+                                        其中 allocated ≈ 22GB（此刻真用）
+```
+
+激活值不被 FSDP 分片，是峰值显存的大头（`use_dynamic_bsz=True` 按 token 数动态组 batch 会影响它）。
+
+### vllm 显存：gpu_memory_utilization 与 0.85→0.7 OOM 归因
+
+`gpu_memory_utilization` 是**允许 vllm 圈走的单卡显存比例**（不是"用了多少"，是"一上来就抢占多少"）：
+
+```
+vllm 抢占 ≈ gpu_memory_utilization × 单卡总显存（装 TP切分后的权重 + KV cache）
+```
+
+| 设置 | vllm 抢占(H800 81.5GB) | 结果 |
+|------|------------------------|------|
+| 0.85 | 0.85 × 81.5 ≈ 69 GB | + actor 训练态 ~22GB → 撞车 **OOM** ❌ |
+| 0.7  | 0.7 × 81.5 ≈ 57 GB | 监控实测 rollout 态 ~61GB，稳定 ✅ |
+
+**为什么 colocate 下会撞车**：actor（FSDP）和 vllm rollout 共用同一批卡，分时复用——vllm rollout 时 actor offload 到 CPU，actor 训练时 vllm sleep。但**切换瞬间两者短暂共存**，且 vllm 抢占的块在 sleep 时不完全释放：
+
+```
+vllm 0.85(69GB) + actor 训练峰值(~22GB) ≈ 91GB > 81.5GB  →  OOM
+vllm 0.7 (57GB) + actor 训练峰值(~22GB) ≈ 79GB < 81.5GB  →  放得下 ✅
+```
+
+我们当初用合成数据（prompt 短）时 0.85 能跑，一换真实 NQ 数据（prompt 更长 → KV cache 和激活值需求更大）就在 step 0→1 切换时 OOM。降到 0.7 是给同卡的 FSDP actor + 切换重叠腾出 ~12GB 安全垫。
+
+### 调参直觉
+
+```
+gpu_memory_utilization ↑ → vllm KV cache ↑ → rollout 吞吐 ↑，但越易与 actor 撞 OOM
+gpu_memory_utilization ↓ → 越安全，但 KV cache 不够时 rollout 排队变慢
+```
+
+经验法则（colocate + 8B + H800）：留出 actor 训练峰值(~22GB) + 安全垫(~5GB)，
+vllm 上限 ≈ (81.5 − 27) / 81.5 ≈ **0.66~0.72**，我们用的 **0.7** 正好在甜区。
+模型更大/序列更长还要再降；若用独立卡（非 colocate），vllm 可拉到 0.9。
